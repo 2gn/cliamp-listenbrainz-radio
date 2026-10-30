@@ -525,7 +525,15 @@ local function refill(force)
         local vid = resolve_track_video_id(item.artist, item.title)
         if vid then
           local track_url = "https://www.youtube.com/watch?v=" .. vid
-          cliamp.queue.add(track_url)
+          -- In cliamp >= 2.1.0 (such as 2.3.0), queue.add accepts a table with clean metadata
+          local ok_add = pcall(cliamp.queue.add, {
+            path   = track_url,
+            title  = item.title,
+            artist = item.artist,
+          })
+          if not ok_add then
+            cliamp.queue.add(track_url)
+          end
           in_queue[key] = true
           added_keys[#added_keys + 1] = key
           added_count = added_count + 1
