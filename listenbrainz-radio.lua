@@ -75,7 +75,7 @@ local MAX_SIMILAR_ARTISTS = math.max(1, math.floor(cfg_num("max_similar_artists"
 local MAX_REC_PER_ARTIST  = math.max(1, math.floor(cfg_num("max_recordings_per_artist", 3)))
 local LB_TOKEN            = cfg_str("token", nil)
 local RESOLVER            = cfg_str("resolver", "auto")
-local CLEAN_TITLES        = cfg_bool("clean_titles", true)
+local CLEAN_TITLES        = cfg_bool("clean_titles", false)
 
 local USER_AGENT = "cliamp-listenbrainz-radio/0.1.4 ( https://github.com/2gn/cliamp-listenbrainz-radio )"
 
