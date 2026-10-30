@@ -75,6 +75,7 @@ local MAX_SIMILAR_ARTISTS = math.max(1, math.floor(cfg_num("max_similar_artists"
 local MAX_REC_PER_ARTIST  = math.max(1, math.floor(cfg_num("max_recordings_per_artist", 3)))
 local LB_TOKEN            = cfg_str("token", nil)
 local RESOLVER            = cfg_str("resolver", "auto")
+local CLEAN_TITLES        = cfg_bool("clean_titles", true)
 
 local USER_AGENT = "cliamp-listenbrainz-radio/0.1.4 ( https://github.com/2gn/cliamp-listenbrainz-radio )"
 
@@ -398,8 +399,35 @@ end
 -- Audio Stream Resolver (YouTube search via HTTP)
 -- =========================================================================
 
+-- Clean remix / dub / mix suffixes when searching for original studio audio
+local function clean_track_title(title)
+  if not title or not CLEAN_TITLES then return title end
+  local cleaned = title:gsub("%s*%b()", function(inside)
+    local lower = inside:lower()
+    if lower:find("mix") or lower:find("remix") or lower:find("dub") or
+       lower:find("edit") or lower:find("version") or lower:find("live") or
+       lower:find("instrumental") or lower:find("bonus") or lower:find("beats") then
+      return ""
+    end
+    return inside
+  end)
+  cleaned = cleaned:gsub("%s*%b[]", function(inside)
+    local lower = inside:lower()
+    if lower:find("mix") or lower:find("remix") or lower:find("dub") or
+       lower:find("edit") or lower:find("version") or lower:find("live") or
+       lower:find("instrumental") or lower:find("bonus") or lower:find("beats") then
+      return ""
+    end
+    return inside
+  end)
+  cleaned = cleaned:gsub("^%s*(.-)%s*$", "%1")
+  if #cleaned == 0 then return title end
+  return cleaned
+end
+
 local function resolve_via_http(artist, title)
-  local query = urlencode(artist .. " " .. title .. " audio")
+  local search_title = clean_track_title(title)
+  local query = urlencode(artist .. " " .. search_title .. " audio")
   local url = "https://www.youtube.com/results?search_query=" .. query
   local body, status = cliamp.http.get(url, {
     headers = {
