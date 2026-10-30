@@ -8,7 +8,7 @@
 local p = plugin.register({
   name        = "listenbrainz-radio",
   type        = "hook",
-  version     = "0.1.2",
+  version     = "0.1.4",
   description = "Endless ListenBrainz radio: queues recommended songs using ListenBrainz API",
   permissions = { "control", "exec" },
 })
@@ -64,7 +64,7 @@ end
 -- =========================================================================
 
 local MIN_AHEAD           = math.max(1, math.floor(cfg_num("min_ahead", 3)))
-local BATCH               = math.max(1, math.floor(cfg_num("batch", 5)))
+local BATCH               = math.max(1, math.floor(cfg_num("batch", 3)))
 local COOLDOWN            = math.max(0, math.floor(cfg_num("cooldown_secs", 20)))
 local HIST_MAX            = math.max(0, math.floor(cfg_num("history_max", 300)))
 local START_ON            = cfg_bool("start_on", true)
@@ -76,7 +76,7 @@ local MAX_REC_PER_ARTIST  = math.max(1, math.floor(cfg_num("max_recordings_per_a
 local LB_TOKEN            = cfg_str("token", nil)
 local RESOLVER            = cfg_str("resolver", "auto")
 
-local USER_AGENT = "cliamp-listenbrainz-radio/0.1.2 ( https://github.com/2gn/cliamp-listenbrainz-radio )"
+local USER_AGENT = "cliamp-listenbrainz-radio/0.1.4 ( https://github.com/2gn/cliamp-listenbrainz-radio )"
 
 -- =========================================================================
 -- Runtime State
@@ -177,25 +177,63 @@ end
 -- =========================================================================
 
 local function extract_seed(item)
-  if not item then return nil, nil end
+  -- 1. Try currently playing track from cliamp.track (populated during playback)
+  local t_artist = cliamp.track.artist()
+  local t_title = cliamp.track.title()
 
-  local artist = item.artist
-  local title = item.title
-
-  -- If artist is clean, use it
-  if artist and type(artist) == "string" and #artist > 0 then
-    return artist, title
+  if t_artist and type(t_artist) == "string" and #t_artist > 0 then
+    return t_artist, t_title
   end
 
-  -- If artist is blank, try splitting "Artist - Title" from title or path
-  local cand = title or item.path
-  if cand and type(cand) == "string" then
-    -- Clean potential file paths or URLs
-    cand = cand:match("([^/\\]+)%.%w+$") or cand
-    local a, t = cand:match("^%s*(.-)%s*[%-–—]%s*(.-)%s*$")
+  if t_title and type(t_title) == "string" and #t_title > 0 and t_title ~= "watch" then
+    local a, t = t_title:match("^%s*(.-)%s*[%-–—]%s*(.-)%s*$")
     if a and t and #a > 0 and #t > 0 then
       a = a:gsub("%s*%- Topic$", "")
       return a, t
+    end
+  end
+
+  -- 2. Try item from queue list
+  if item then
+    local artist = item.artist
+    local title = item.title
+
+    if artist and type(artist) == "string" and #artist > 0 then
+      return artist, title
+    end
+
+    if title and type(title) == "string" and #title > 0 and title ~= "watch" then
+      local a, t = title:match("^%s*(.-)%s*[%-–—]%s*(.-)%s*$")
+      if a and t and #a > 0 and #t > 0 then
+        a = a:gsub("%s*%- Topic$", "")
+        return a, t
+      end
+    end
+
+    -- 3. If item path is a YouTube URL, fetch title from YouTube oEmbed
+    local path = item.path or ""
+    local vid = path:match("[?&]v=([%w%-_]+)") or path:match("youtu%.be/([%w%-_]+)")
+    if vid then
+      local oembed_url = "https://www.youtube.com/oembed?url=" .. urlencode("https://www.youtube.com/watch?v=" .. vid) .. "&format=json"
+      local ok, body, status = pcall(function()
+        return cliamp.http.get(oembed_url, {
+          headers = { ["User-Agent"] = USER_AGENT }
+        })
+      end)
+      if ok and status == 200 and body then
+        local dec_ok, data = pcall(cliamp.json.decode, body)
+        if dec_ok and type(data) == "table" and data.title then
+          local a, t = data.title:match("^%s*(.-)%s*[%-–—]%s*(.-)%s*$")
+          if a and t and #a > 0 and #t > 0 then
+            a = a:gsub("%s*%- Topic$", "")
+            return a, t
+          end
+          if data.author_name then
+            local a = data.author_name:gsub("VEVO$", ""):gsub("%s*%- Topic$", "")
+            return a, data.title
+          end
+        end
+      end
     end
   end
 
@@ -213,17 +251,19 @@ local function resolve_artist_mbid(artist_name)
 
   local query = "artist:" .. urlencode(artist_name)
   local url = "https://musicbrainz.org/ws/2/artist/?query=" .. query .. "&fmt=json"
-  local body, status = cliamp.http.get(url, {
-    headers = { ["User-Agent"] = USER_AGENT }
-  })
+  local ok, body, status = pcall(function()
+    return cliamp.http.get(url, {
+      headers = { ["User-Agent"] = USER_AGENT }
+    })
+  end)
 
-  if status ~= 200 or not body then
+  if not ok or status ~= 200 or not body then
     cliamp.log.warn("lb-radio: MusicBrainz search failed with status " .. tostring(status))
     return nil
   end
 
-  local ok, data = pcall(cliamp.json.decode, body)
-  if not ok or type(data) ~= "table" or not data.artists or #data.artists == 0 then
+  local dec_ok, data = pcall(cliamp.json.decode, body)
+  if not dec_ok or type(data) ~= "table" or not data.artists or #data.artists == 0 then
     cliamp.log.warn("lb-radio: artist not found on MusicBrainz: " .. artist_name)
     return nil
   end
@@ -243,22 +283,23 @@ local function fetch_lb_artist_radio(seed_artist_mbid, mode)
     seed_artist_mbid, clean_m, MAX_SIMILAR_ARTISTS, MAX_REC_PER_ARTIST, POP_BEGIN, POP_END
   )
 
-  local body, status = cliamp.http.get(url, {
-    headers = { ["User-Agent"] = USER_AGENT }
-  })
+  local ok, body, status = pcall(function()
+    return cliamp.http.get(url, {
+      headers = { ["User-Agent"] = USER_AGENT }
+    })
+  end)
 
-  if status ~= 200 or not body then
+  if not ok or status ~= 200 or not body then
     cliamp.log.warn("lb-radio: ListenBrainz artist radio failed with status " .. tostring(status))
     return {}
   end
 
-  local ok, data = pcall(cliamp.json.decode, body)
-  if not ok or type(data) ~= "table" then
+  local dec_ok, data = pcall(cliamp.json.decode, body)
+  if not dec_ok or type(data) ~= "table" then
     cliamp.log.warn("lb-radio: failed to parse ListenBrainz artist radio response")
     return {}
   end
 
-  -- Flatten recordings list: { { mbid = "...", artist = "..." }, ... }
   local candidates = {}
   local mbids_to_fetch = {}
 
@@ -283,14 +324,16 @@ local function fetch_lb_artist_radio(seed_artist_mbid, mode)
 
   -- Batch lookup recording titles from ListenBrainz metadata endpoint
   local rec_url = "https://api.listenbrainz.org/1/metadata/recording/?recording_mbids=" .. table.concat(mbids_to_fetch, ",")
-  local meta_body, meta_status = cliamp.http.get(rec_url, {
-    headers = { ["User-Agent"] = USER_AGENT }
-  })
+  local meta_ok, meta_body, meta_status = pcall(function()
+    return cliamp.http.get(rec_url, {
+      headers = { ["User-Agent"] = USER_AGENT }
+    })
+  end)
 
   local meta_map = {}
-  if meta_status == 200 and meta_body then
-    local meta_ok, meta_data = pcall(cliamp.json.decode, meta_body)
-    if meta_ok and type(meta_data) == "table" then
+  if meta_ok and meta_status == 200 and meta_body then
+    local d_ok, meta_data = pcall(cliamp.json.decode, meta_body)
+    if d_ok and type(meta_data) == "table" then
       meta_map = meta_data
     end
   end
@@ -317,20 +360,22 @@ local function fetch_lb_explore_radio(seed_artist, mode, token)
   local prompt = "artist:(" .. seed_artist .. ")"
   local url = "https://api.listenbrainz.org/1/explore/lb-radio?prompt=" .. urlencode(prompt) .. "&mode=" .. clean_m
 
-  local body, status = cliamp.http.get(url, {
-    headers = {
-      ["User-Agent"]    = USER_AGENT,
-      ["Authorization"] = "Token " .. token,
-    }
-  })
+  local ok, body, status = pcall(function()
+    return cliamp.http.get(url, {
+      headers = {
+        ["User-Agent"]    = USER_AGENT,
+        ["Authorization"] = "Token " .. token,
+      }
+    })
+  end)
 
-  if status ~= 200 or not body then
+  if not ok or status ~= 200 or not body then
     cliamp.log.warn("lb-radio: explore/lb-radio failed with status " .. tostring(status))
     return {}
   end
 
-  local ok, data = pcall(cliamp.json.decode, body)
-  if not ok or type(data) ~= "table" then return {} end
+  local dec_ok, data = pcall(cliamp.json.decode, body)
+  if not dec_ok or type(data) ~= "table" then return {} end
 
   local tracks = data.payload and data.payload.jspf and data.payload.jspf.playlist and data.payload.jspf.playlist.track
   if type(tracks) ~= "table" then return {} end
@@ -350,10 +395,9 @@ local function fetch_lb_explore_radio(seed_artist, mode, token)
 end
 
 -- =========================================================================
--- Audio Stream Resolver (YouTube search via HTTP / yt-dlp)
+-- Audio Stream Resolver (YouTube search via HTTP)
 -- =========================================================================
 
--- Method 1: Pure HTTP search (zero-dependency, parses videoId directly)
 local function resolve_via_http(artist, title)
   local query = urlencode(artist .. " " .. title .. " audio")
   local url = "https://www.youtube.com/results?search_query=" .. query
@@ -365,17 +409,20 @@ local function resolve_via_http(artist, title)
   })
 
   if status == 200 and body then
-    local vid = body:match('"videoId":"([%w_%-]{11})"')
-    if vid then return vid end
+    -- In Lua pattern matching: [%w%-_] captures alphanumeric, hyphen and underscore
+    local vid = body:match('"videoId":"([%w%-_]+)"')
+    if vid and #vid == 11 then
+      return vid
+    end
   end
   return nil
 end
 
--- Resolve video ID based on configured resolver option
+-- Safely resolve video ID with pcall
 local function resolve_track_video_id(artist, title)
   if RESOLVER == "http" or RESOLVER == "auto" then
-    local vid = resolve_via_http(artist, title)
-    if vid then return vid end
+    local ok, vid = pcall(resolve_via_http, artist, title)
+    if ok and vid then return vid end
   end
   return nil
 end
@@ -435,19 +482,21 @@ local function refill(force)
     end
   end
 
-  -- Pick tracks to add
+  -- Pick tracks to add (bound attempts to 3 to strictly respect the 5s hook deadline)
   local added_count = 0
+  local attempts    = 0
+  local max_attempts = math.min(BATCH, 3)
   local added_keys  = {}
   local remaining_buffered = {}
 
   for _, item in ipairs(buffered) do
     local key = normalize_key(item.artist, item.title)
-    if added_count < BATCH then
+    if added_count < BATCH and attempts < max_attempts then
       if not in_queue[key] and not in_history(key) then
+        attempts = attempts + 1
         local vid = resolve_track_video_id(item.artist, item.title)
         if vid then
           local track_url = "https://www.youtube.com/watch?v=" .. vid
-          -- Pass URL string directly so cliamp's remote resolver processes it
           cliamp.queue.add(track_url)
           in_queue[key] = true
           added_keys[#added_keys + 1] = key
