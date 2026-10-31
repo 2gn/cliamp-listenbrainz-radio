@@ -775,113 +775,120 @@ local function refill(force)
   local cur_item = list[cur + 1]
   local st_artist, st_mbid = get_station_seed()
 
-  -- Check if the current track was manually started by user
-  -- (i.e. not queued by listenbrainz-radio, or no station seed exists)
-  local is_manual = false
-  if cur_item and not is_auto_queued(cur_item) then
-    is_manual = true
-  end
-
-  if is_manual or not st_artist then
-    local a, t, m = extract_clean_metadata(cur_item)
-    if a and #a > 0 then
-      if a ~= st_artist then
-        cliamp.log.info(("lb-radio: manual track detected (%s - %s), anchoring station seed to %q"):format(a, t or "", a))
-        set_station_seed(a, m)
-        set_buffered_recs({}) -- clear buffer so recommendations match new seed
-        st_artist, st_mbid = a, m
-      end
-    end
-  end
-
-  if not st_artist then
-    cliamp.log.warn("lb-radio: could not determine station seed artist")
-    return
-  end
-
   refilling = true
-  last_run  = os.time()
-  local mode = get_active_mode()
+  local start_time = os.time()
 
-  -- Check existing queue items to avoid duplicates
-  local in_queue = {}
-  for _, it in ipairs(list) do
-    local norm = normalize_key(it.artist, it.title)
-    in_queue[norm] = true
-  end
-
-  -- Get candidate recommendations from buffer or fresh API fetch
-  local buffered = get_buffered_recs()
-  if #buffered < BATCH then
-    local fresh = {}
-    if LB_TOKEN and #LB_TOKEN > 0 then
-      cliamp.log.info(("lb-radio: fetching explore radio for station seed %q (mode: %s)"):format(st_artist, mode))
-      fresh = fetch_lb_explore_radio(st_artist, mode, LB_TOKEN)
+  local ok, err = pcall(function()
+    -- Check if the current track was manually started by user
+    -- (i.e. not queued by listenbrainz-radio, or no station seed exists)
+    local is_manual = false
+    if cur_item and not is_auto_queued(cur_item) then
+      is_manual = true
     end
 
-    if #fresh == 0 then
-      cliamp.log.info(("lb-radio: fetching artist radio for station seed %q (mode: %s)"):format(st_artist, mode))
-      local artist_mbid = st_mbid or resolve_artist_mbid(st_artist)
-      if artist_mbid then
-        fresh = fetch_lb_artist_radio(artist_mbid, mode)
-      end
-    end
-
-    -- Append fresh candidates to buffer
-    for _, item in ipairs(fresh) do
-      buffered[#buffered + 1] = item
-    end
-  end
-
-  -- Pick tracks to add (bound attempts to 3 to strictly respect the 5s hook deadline)
-  local added_count = 0
-  local attempts    = 0
-  local max_attempts = math.min(BATCH, 3)
-  local added_keys  = {}
-  local remaining_buffered = {}
-
-  for _, item in ipairs(buffered) do
-    local key = normalize_key(item.artist, item.title)
-    if added_count < BATCH and attempts < max_attempts then
-      if not in_queue[key] and not in_history(key) then
-        attempts = attempts + 1
-        local vid = resolve_track_video_id(item.artist, item.title)
-        if vid then
-          local track_url = "https://www.youtube.com/watch?v=" .. vid
-          -- In cliamp >= 2.1.0, queue.add accepts a table with clean metadata
-          local ok_add = pcall(cliamp.queue.add, {
-            path   = track_url,
-            title  = item.title,
-            artist = item.artist,
-          })
-          if not ok_add then
-            cliamp.queue.add(track_url)
-          end
-          -- Mark this track as auto-queued so playing it won't overwrite station seed
-          mark_auto_queued(track_url, item.artist, item.title)
-          in_queue[key] = true
-          added_keys[#added_keys + 1] = key
-          added_count = added_count + 1
-        else
-          cliamp.log.debug(("lb-radio: could not resolve stream for %s - %s"):format(item.artist, item.title))
+    if is_manual or not st_artist then
+      local a, t, m = extract_clean_metadata(cur_item)
+      if a and #a > 0 then
+        if a ~= st_artist then
+          cliamp.log.info(("lb-radio: manual track detected (%s - %s), anchoring station seed to %q"):format(a, t or "", a))
+          set_station_seed(a, m)
+          set_buffered_recs({}) -- clear buffer so recommendations match new seed
+          st_artist, st_mbid = a, m
         end
       end
-    else
-      remaining_buffered[#remaining_buffered + 1] = item
     end
-  end
 
-  set_buffered_recs(remaining_buffered)
+    if not st_artist then
+      cliamp.log.warn("lb-radio: could not determine station seed artist")
+      return
+    end
 
-  if added_count > 0 then
-    remember(added_keys)
-    cliamp.log.info(("lb-radio: added %d tracks (station seed: %s, mode: %s)"):format(added_count, st_artist, mode))
-    cliamp.message("LB radio +" .. added_count)
-  else
-    cliamp.log.warn("lb-radio: no new recommendations added")
-  end
+    last_run  = os.time()
+    local mode = get_active_mode()
+
+    -- Check existing queue items to avoid duplicates
+    local in_queue = {}
+    for _, it in ipairs(list) do
+      local norm = normalize_key(it.artist, it.title)
+      in_queue[norm] = true
+    end
+
+    -- Get candidate recommendations from buffer or fresh API fetch
+    local buffered = get_buffered_recs()
+    if #buffered < BATCH and (os.time() - start_time) < 3 then
+      local fresh = {}
+      if LB_TOKEN and #LB_TOKEN > 0 then
+        cliamp.log.info(("lb-radio: fetching explore radio for station seed %q (mode: %s)"):format(st_artist, mode))
+        fresh = fetch_lb_explore_radio(st_artist, mode, LB_TOKEN)
+      end
+
+      if #fresh == 0 then
+        cliamp.log.info(("lb-radio: fetching artist radio for station seed %q (mode: %s)"):format(st_artist, mode))
+        local artist_mbid = st_mbid or resolve_artist_mbid(st_artist)
+        if artist_mbid then
+          fresh = fetch_lb_artist_radio(artist_mbid, mode)
+        end
+      end
+
+      -- Append fresh candidates to buffer
+      for _, item in ipairs(fresh) do
+        buffered[#buffered + 1] = item
+      end
+    end
+
+    -- Pick tracks to add (respecting 3s safeguard to stay well within 5s hook deadline)
+    local added_count = 0
+    local attempts    = 0
+    local max_attempts = math.min(BATCH, 2)
+    local added_keys  = {}
+    local remaining_buffered = {}
+
+    for _, item in ipairs(buffered) do
+      local key = normalize_key(item.artist, item.title)
+      if added_count < BATCH and attempts < max_attempts and (os.time() - start_time) < 3 then
+        if not in_queue[key] and not in_history(key) then
+          attempts = attempts + 1
+          local vid = resolve_track_video_id(item.artist, item.title)
+          if vid then
+            local track_url = "https://www.youtube.com/watch?v=" .. vid
+            -- In cliamp >= 2.1.0, queue.add accepts a table with clean metadata
+            local ok_add = pcall(cliamp.queue.add, {
+              path   = track_url,
+              title  = item.title,
+              artist = item.artist,
+            })
+            if not ok_add then
+              cliamp.queue.add(track_url)
+            end
+            -- Mark this track as auto-queued so playing it won't overwrite station seed
+            mark_auto_queued(track_url, item.artist, item.title)
+            in_queue[key] = true
+            added_keys[#added_keys + 1] = key
+            added_count = added_count + 1
+          else
+            cliamp.log.debug(("lb-radio: could not resolve stream for %s - %s"):format(item.artist, item.title))
+          end
+        end
+      else
+        remaining_buffered[#remaining_buffered + 1] = item
+      end
+    end
+
+    set_buffered_recs(remaining_buffered)
+
+    if added_count > 0 then
+      remember(added_keys)
+      cliamp.log.info(("lb-radio: added %d tracks (station seed: %s, mode: %s)"):format(added_count, st_artist, mode))
+      cliamp.message("LB radio +" .. added_count)
+    else
+      cliamp.log.warn("lb-radio: no new recommendations added")
+    end
+  end)
 
   refilling = false
+  if not ok then
+    cliamp.log.warn("lb-radio: refill caught error: " .. tostring(err))
+  end
 end
 
 -- =========================================================================
@@ -889,7 +896,6 @@ end
 -- =========================================================================
 
 p:on("track.change", function() refill(false) end)
-p:on("queue.change", function() refill(false) end)
 p:on("app.start",    function() refill(false) end)
 
 -- =========================================================================
