@@ -1,6 +1,6 @@
 -- listenbrainz-radio: endless ListenBrainz radio for cliamp.
 -- Automatically tops up the playback queue with recommended tracks
--- fetched from the ListenBrainz & MusicBrainz APIs.
+-- fetched from the ListenBrainz & MusicBrainz APIs with Station Seed.
 --
 -- License: MIT (c) 2026
 -- Compatible with cliamp Lua 5.1 plugin runtime.
@@ -8,8 +8,8 @@
 local p = plugin.register({
   name        = "listenbrainz-radio",
   type        = "hook",
-  version     = "0.1.4",
-  description = "Endless ListenBrainz radio: queues recommended songs using ListenBrainz API",
+  version     = "0.2.0",
+  description = "Endless ListenBrainz radio: queues recommended songs using ListenBrainz API with Station Seed",
   permissions = { "control", "exec" },
 })
 
@@ -77,10 +77,10 @@ local LB_TOKEN            = cfg_str("token", nil)
 local RESOLVER            = cfg_str("resolver", "auto")
 local CLEAN_TITLES        = cfg_bool("clean_titles", false)
 
-local USER_AGENT = "cliamp-listenbrainz-radio/0.1.4 ( https://github.com/2gn/cliamp-listenbrainz-radio )"
+local USER_AGENT = "cliamp-listenbrainz-radio/0.2.0 ( https://github.com/2gn/cliamp-listenbrainz-radio )"
 
 -- =========================================================================
--- Runtime State
+-- Runtime State & Controls
 -- =========================================================================
 
 local refilling = false
@@ -107,7 +107,85 @@ local function set_active_mode(m)
 end
 
 -- =========================================================================
--- Persistent History & Cache
+-- Station Seed Management
+-- =========================================================================
+
+local function get_station_seed()
+  local artist = cliamp.store.get("station_seed_artist")
+  local mbid   = cliamp.store.get("station_seed_mbid")
+  return artist, mbid
+end
+
+local function set_station_seed(artist, mbid)
+  cliamp.store.set("station_seed_artist", artist)
+  cliamp.store.set("station_seed_mbid", mbid)
+end
+
+local function clear_station_seed()
+  cliamp.store.set("station_seed_artist", nil)
+  cliamp.store.set("station_seed_mbid", nil)
+end
+
+-- =========================================================================
+-- Auto-Queued Tracking (Preventing recommendations from overriding station seed)
+-- =========================================================================
+
+local function auto_queued_map()
+  return cliamp.store.get("auto_queued_keys") or {}
+end
+
+local function normalize_key(artist, title)
+  local a = (artist or ""):lower():gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+  local t = (title or ""):lower():gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+  return a .. " - " .. t
+end
+
+local function mark_auto_queued(path, artist, title)
+  local map = auto_queued_map()
+  if path and #path > 0 then
+    map[path] = true
+    local vid = path:match("[?&]v=([%w%-_]+)") or path:match("youtu%.be/([%w%-_]+)")
+    if vid then
+      map["vid:" .. vid] = true
+    end
+  end
+  if artist and title then
+    map[normalize_key(artist, title)] = true
+  end
+
+  local count = 0
+  for _ in pairs(map) do count = count + 1 end
+  if count > 500 then
+    map = {}
+    if path and #path > 0 then map[path] = true end
+    if artist and title then map[normalize_key(artist, title)] = true end
+  end
+  cliamp.store.set("auto_queued_keys", map)
+end
+
+local function is_auto_queued(item)
+  if not item then return false end
+  local map = auto_queued_map()
+  if item.path and map[item.path] then
+    return true
+  end
+  if item.path then
+    local vid = item.path:match("[?&]v=([%w%-_]+)") or item.path:match("youtu%.be/([%w%-_]+)")
+    if vid and map["vid:" .. vid] then
+      return true
+    end
+  end
+  if item.artist and item.title then
+    local k = normalize_key(item.artist, item.title)
+    if map[k] then
+      return true
+    end
+  end
+  return false
+end
+
+-- =========================================================================
+-- Persistent History & MBID Cache
 -- =========================================================================
 
 local function history()
@@ -132,19 +210,15 @@ local function in_history(key)
   return false
 end
 
-local function normalize_key(artist, title)
-  local a = (artist or ""):lower():gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-  local t = (title or ""):lower():gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
-  return a .. " - " .. t
-end
-
 -- Cache artist name -> MusicBrainz artist MBID
 local function get_cached_artist_mbid(artist_name)
+  if not artist_name then return nil end
   local cache = cliamp.store.get("mbid_cache") or {}
   return cache[artist_name:lower()]
 end
 
 local function cache_artist_mbid(artist_name, mbid)
+  if not artist_name or not mbid then return end
   local cache = cliamp.store.get("mbid_cache") or {}
   cache[artist_name:lower()] = mbid
   cliamp.store.set("mbid_cache", cache)
@@ -174,23 +248,292 @@ local function urlencode(str)
 end
 
 -- =========================================================================
--- Track Metadata Extraction
+-- String Cleaning & Tag Stripping Utilities
 -- =========================================================================
 
-local function extract_seed(item)
-  -- 1. Try currently playing track from cliamp.track (populated during playback)
-  local t_artist = cliamp.track.artist()
-  local t_title = cliamp.track.title()
+-- Clean common video fluff from YouTube titles
+local function clean_video_fluff(s)
+  if not s then return "" end
+  local tag_patterns = {
+    "%s*%([Oo]fficial%s+[Mm]usic%s+[Vv]ideo%)",
+    "%s*%[[Oo]fficial%s+[Mm]usic%s+[Vv]ideo%]",
+    "%s*%([Oo]fficial%s+[Vv]ideo%)",
+    "%s*%[[Oo]fficial%s+[Vv]ideo%]",
+    "%s*%([Oo]fficial%s+[Aa]udio%)",
+    "%s*%[[Oo]fficial%s+[Aa]udio%]",
+    "%s*%([Oo]fficial%s+[Vv]isualizer%)",
+    "%s*%[[Oo]fficial%s+[Vv]isualizer%]",
+    "%s*%([Oo]fficial%s+[Ll]yric%s+[Vv]ideo%)",
+    "%s*%[[Oo]fficial%s+[Ll]yric%s+[Vv]ideo%]",
+    "%s*%([Oo]fficial%s+[Hh][Dd]%s+[Vv]ideo%)",
+    "%s*%[[Oo]fficial%s+[Hh][Dd]%s+[Vv]ideo%]",
+    "%s*%([Ll]yric%s+[Vv]ideo%)",
+    "%s*%[[Ll]yric%s+[Vv]ideo%]",
+    "%s*%([Vv]isualizer%)",
+    "%s*%[[Vv]isualizer%]",
+    "%s*%([Aa]udio%)",
+    "%s*%[[Aa]udio%]",
+    "%s*%([Ll]yrics?%)",
+    "%s*%[[Ll]yrics?%]",
+    "%s*%([Mm]usic%s+[Vv]ideo%)",
+    "%s*%[[Mm]usic%s+[Vv]ideo%]",
+    "%s*%([Hh][Dd]%)",
+    "%s*%[[Hh][Dd]%]",
+    "%s*%([Hh][Qq]%)",
+    "%s*%[[Hh][Qq]%]",
+    "%s*%([4kK]%)",
+    "%s*%[[4kK]%]",
+    "%s*%([4kK]%s+[Uu][Hh][Dd]%)",
+    "%s*%[[4kK]%s+[Uu][Hh][Dd]%]",
+  }
+  for _, pat in ipairs(tag_patterns) do
+    s = s:gsub(pat, "")
+  end
+  return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
 
-  if t_artist and type(t_artist) == "string" and #t_artist > 0 then
-    return t_artist, t_title
+-- Clean channel / topic tags from artist names
+local function clean_artist_name(name)
+  if not name then return "" end
+  name = name:gsub("%s*%- Topic$", "")
+  name = name:gsub("%s*VEVO$", "")
+  name = name:gsub("%s*Official$", "")
+  name = name:gsub("%s*Records$", "")
+  name = name:gsub("%s*Music$", "")
+  return (name:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+-- Strip featured artists for cleaner MusicBrainz artist resolution
+local function strip_featuring(artist)
+  if not artist then return "" end
+  local a = artist
+  a = a:gsub("%s+[Ff][Tt]%.?%s+.*$", "")
+  a = a:gsub("%s+[Ff][Ee][Aa][Tt]%.?%s+.*$", "")
+  a = a:gsub("%s+[Ff][Ee][Aa][Tt][Uu][Rr][Ii][Nn][Gg]%s+.*$", "")
+  a = a:gsub("%s*&%s+.*$", "")
+  a = a:gsub("%s+[Ww][Ii][Tt][Hh]%s+.*$", "")
+  return (a:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+-- Split title string by hyphens (standard hyphen, en-dash, em-dash)
+local function split_hyphens(str)
+  if not str then return {} end
+  local s = str:gsub("–", "-"):gsub("—", "-")
+  local parts = {}
+  for part in s:gmatch("[^%-]+") do
+    local trimmed = part:gsub("^%s*(.-)%s*$", "%1")
+    if #trimmed > 0 then
+      parts[#parts + 1] = trimmed
+    end
+  end
+  return parts
+end
+
+-- =========================================================================
+-- MusicBrainz & ListenBrainz API Clients
+-- =========================================================================
+
+-- Look up artist MBID using MusicBrainz Search API
+local function resolve_artist_mbid(artist_name)
+  if not artist_name or #artist_name == 0 then return nil end
+  local clean = clean_artist_name(artist_name)
+  local cached = get_cached_artist_mbid(clean)
+  if cached then return cached end
+
+  local query = "artist:" .. urlencode(clean)
+  local url = "https://musicbrainz.org/ws/2/artist/?query=" .. query .. "&fmt=json&limit=3"
+  local ok, body, status = pcall(function()
+    return cliamp.http.get(url, {
+      headers = { ["User-Agent"] = USER_AGENT }
+    })
+  end)
+
+  if not ok or status ~= 200 or not body then
+    return nil
   end
 
-  if t_title and type(t_title) == "string" and #t_title > 0 and t_title ~= "watch" then
-    local a, t = t_title:match("^%s*(.-)%s*[%-–—]%s*(.-)%s*$")
-    if a and t and #a > 0 and #t > 0 then
-      a = a:gsub("%s*%- Topic$", "")
-      return a, t
+  local dec_ok, data = pcall(cliamp.json.decode, body)
+  if not dec_ok or type(data) ~= "table" or not data.artists or #data.artists == 0 then
+    return nil
+  end
+
+  local clean_l = clean:lower()
+  -- Try to find matching artist name in top results
+  for i = 1, math.min(#data.artists, 3) do
+    local a = data.artists[i]
+    local name = a.name or ""
+    local sort_name = a["sort-name"] or ""
+    local score = tonumber(a.score) or 0
+    if (name:lower() == clean_l or sort_name:lower() == clean_l) and score >= 70 then
+      if a.id then
+        cache_artist_mbid(clean, a.id)
+        return a.id
+      end
+    end
+  end
+
+  -- If top score is 100, trust it
+  local first = data.artists[1]
+  if (tonumber(first.score) or 0) == 100 and first.id then
+    cache_artist_mbid(clean, first.id)
+    return first.id
+  end
+
+  -- Try stripping featuring / collaboration if present
+  local stripped = strip_featuring(clean)
+  if stripped ~= clean and #stripped > 0 then
+    local s_cached = get_cached_artist_mbid(stripped)
+    if s_cached then return s_cached end
+    local sub_mbid = resolve_artist_mbid(stripped)
+    if sub_mbid then
+      cache_artist_mbid(clean, sub_mbid)
+      return sub_mbid
+    end
+  end
+
+  return nil
+end
+
+-- Fallback recording search on MusicBrainz (resolves ambiguous YouTube titles)
+local function resolve_recording_mb(query_str)
+  if not query_str or #query_str == 0 then return nil end
+  local query = urlencode(query_str)
+  local url = "https://musicbrainz.org/ws/2/recording/?query=" .. query .. "&fmt=json&limit=3"
+  local ok, body, status = pcall(function()
+    return cliamp.http.get(url, {
+      headers = { ["User-Agent"] = USER_AGENT }
+    })
+  end)
+
+  if not ok or status ~= 200 or not body then
+    return nil
+  end
+
+  local dec_ok, data = pcall(cliamp.json.decode, body)
+  if not dec_ok or type(data) ~= "table" or not data.recordings or #data.recordings == 0 then
+    return nil
+  end
+
+  local rec = data.recordings[1]
+  local score = tonumber(rec.score) or 0
+  if score >= 70 and rec.title and rec["artist-credit"] and rec["artist-credit"][1] then
+    local a_info = rec["artist-credit"][1]
+    local a_name = a_info.name or (a_info.artist and a_info.artist.name)
+    local a_id = a_info.artist and a_info.artist.id
+    if a_name and #a_name > 0 then
+      if a_id then
+        cache_artist_mbid(a_name, a_id)
+      end
+      return {
+        title = rec.title,
+        artist = a_name,
+        artist_mbid = a_id,
+        recording_mbid = rec.id,
+      }
+    end
+  end
+
+  return nil
+end
+
+-- Parse raw YouTube title into artist, title, and mbid
+local function parse_artist_and_title(raw_title, fallback_artist)
+  local s = clean_video_fluff(raw_title or "")
+  local parts = split_hyphens(s)
+
+  if #parts == 0 then
+    if fallback_artist and #fallback_artist > 0 then
+      local ca = clean_artist_name(fallback_artist)
+      return ca, raw_title, resolve_artist_mbid(ca)
+    end
+    return nil, raw_title, nil
+  end
+
+  if #parts == 1 then
+    if fallback_artist and #fallback_artist > 0 then
+      local ca = clean_artist_name(fallback_artist)
+      return ca, parts[1], resolve_artist_mbid(ca)
+    end
+    -- Try recording search on MusicBrainz
+    local rec = resolve_recording_mb(parts[1])
+    if rec then
+      return rec.artist, rec.title, rec.artist_mbid
+    end
+    return nil, parts[1], nil
+  end
+
+  if #parts == 2 then
+    local p1 = clean_artist_name(parts[1])
+    local p2 = clean_video_fluff(parts[2])
+    local mbid = resolve_artist_mbid(p1)
+    if not mbid and (p1:find("[Ff][Tt]%.?") or p1:find("&") or p1:find("[Ff][Ee][Aa][Tt]")) then
+      mbid = resolve_artist_mbid(strip_featuring(p1))
+    end
+    if not mbid then
+      local rec = resolve_recording_mb(s)
+      if rec then
+        return rec.artist, rec.title, rec.artist_mbid
+      end
+    end
+    return p1, p2, mbid
+  end
+
+  -- #parts >= 3:
+  -- Handle "channel - Artist - Title" (e.g. "mypassionfruit - Kinobe - Slip Into Something...")
+  local p2_clean = clean_artist_name(parts[2])
+  local mbid2 = resolve_artist_mbid(p2_clean)
+  if mbid2 then
+    local title_parts = {}
+    for i = 3, #parts do
+      title_parts[#title_parts + 1] = parts[i]
+    end
+    local title_str = clean_video_fluff(table.concat(title_parts, " - "))
+    return p2_clean, title_str, mbid2
+  end
+
+  -- Handle "Artist - Title - Subtitle" (e.g. "Pink Floyd - Another Brick in the Wall - Part 2")
+  local p1_clean = clean_artist_name(parts[1])
+  local mbid1 = resolve_artist_mbid(p1_clean)
+  if mbid1 then
+    local title_parts = {}
+    for i = 2, #parts do
+      title_parts[#title_parts + 1] = parts[i]
+    end
+    local title_str = clean_video_fluff(table.concat(title_parts, " - "))
+    return p1_clean, title_str, mbid1
+  end
+
+  -- Fallback to recording search
+  local rec = resolve_recording_mb(s)
+  if rec then
+    return rec.artist, rec.title, rec.artist_mbid
+  end
+
+  -- Final fallback: part 1 as artist, remainder as title
+  local fallback_title_parts = {}
+  for i = 2, #parts do
+    fallback_title_parts[#fallback_title_parts + 1] = parts[i]
+  end
+  return p1_clean, clean_video_fluff(table.concat(fallback_title_parts, " - ")), nil
+end
+
+-- Extract clean metadata from currently playing track or item
+local function extract_clean_metadata(item)
+  -- 1. Try currently playing track from cliamp.track
+  local ok_t, t_artist = pcall(cliamp.track.artist)
+  local ok_tt, t_title = pcall(cliamp.track.title)
+
+  if ok_t and t_artist and type(t_artist) == "string" and #t_artist > 0 and not t_artist:find("%- Topic$") and t_artist ~= "Topic" then
+    local clean_a = clean_artist_name(t_artist)
+    local clean_t = clean_video_fluff(t_title or "")
+    local mbid = resolve_artist_mbid(clean_a)
+    return clean_a, clean_t, mbid
+  end
+
+  if ok_tt and t_title and type(t_title) == "string" and #t_title > 0 and t_title ~= "watch" then
+    local a, t, m = parse_artist_and_title(t_title, (ok_t and t_artist) or nil)
+    if a and #a > 0 then
+      return a, t, m
     end
   end
 
@@ -199,15 +542,17 @@ local function extract_seed(item)
     local artist = item.artist
     local title = item.title
 
-    if artist and type(artist) == "string" and #artist > 0 then
-      return artist, title
+    if artist and type(artist) == "string" and #artist > 0 and not artist:find("%- Topic$") and artist ~= "Topic" then
+      local clean_a = clean_artist_name(artist)
+      local clean_t = clean_video_fluff(title or "")
+      local mbid = resolve_artist_mbid(clean_a)
+      return clean_a, clean_t, mbid
     end
 
     if title and type(title) == "string" and #title > 0 and title ~= "watch" then
-      local a, t = title:match("^%s*(.-)%s*[%-–—]%s*(.-)%s*$")
-      if a and t and #a > 0 and #t > 0 then
-        a = a:gsub("%s*%- Topic$", "")
-        return a, t
+      local a, t, m = parse_artist_and_title(title, artist)
+      if a and #a > 0 then
+        return a, t, m
       end
     end
 
@@ -224,56 +569,16 @@ local function extract_seed(item)
       if ok and status == 200 and body then
         local dec_ok, data = pcall(cliamp.json.decode, body)
         if dec_ok and type(data) == "table" and data.title then
-          local a, t = data.title:match("^%s*(.-)%s*[%-–—]%s*(.-)%s*$")
-          if a and t and #a > 0 and #t > 0 then
-            a = a:gsub("%s*%- Topic$", "")
-            return a, t
-          end
-          if data.author_name then
-            local a = data.author_name:gsub("VEVO$", ""):gsub("%s*%- Topic$", "")
-            return a, data.title
+          local a, t, m = parse_artist_and_title(data.title, data.author_name)
+          if a and #a > 0 then
+            return a, t, m
           end
         end
       end
     end
   end
 
-  return nil, nil
-end
-
--- =========================================================================
--- MusicBrainz & ListenBrainz API Clients
--- =========================================================================
-
--- Look up artist MBID using MusicBrainz Search API
-local function resolve_artist_mbid(artist_name)
-  local cached = get_cached_artist_mbid(artist_name)
-  if cached then return cached end
-
-  local query = "artist:" .. urlencode(artist_name)
-  local url = "https://musicbrainz.org/ws/2/artist/?query=" .. query .. "&fmt=json"
-  local ok, body, status = pcall(function()
-    return cliamp.http.get(url, {
-      headers = { ["User-Agent"] = USER_AGENT }
-    })
-  end)
-
-  if not ok or status ~= 200 or not body then
-    cliamp.log.warn("lb-radio: MusicBrainz search failed with status " .. tostring(status))
-    return nil
-  end
-
-  local dec_ok, data = pcall(cliamp.json.decode, body)
-  if not dec_ok or type(data) ~= "table" or not data.artists or #data.artists == 0 then
-    cliamp.log.warn("lb-radio: artist not found on MusicBrainz: " .. artist_name)
-    return nil
-  end
-
-  local mbid = data.artists[1].id
-  if mbid then
-    cache_artist_mbid(artist_name, mbid)
-  end
-  return mbid
+  return nil, nil, nil
 end
 
 -- Fetch recommendations using public ListenBrainz Artist Radio endpoint
@@ -437,8 +742,7 @@ local function resolve_via_http(artist, title)
   })
 
   if status == 200 and body then
-    -- In Lua pattern matching: [%w%-_] captures alphanumeric, hyphen and underscore
-    local vid = body:match('"videoId":"([%w%-_]+)"')
+    local vid = body:match('{"videoRenderer":{"videoId":"([%w%-_]+)"') or body:match('"videoId":"([%w%-_]+)"')
     if vid and #vid == 11 then
       return vid
     end
@@ -446,7 +750,6 @@ local function resolve_via_http(artist, title)
   return nil
 end
 
--- Safely resolve video ID with pcall
 local function resolve_track_video_id(artist, title)
   if RESOLVER == "http" or RESOLVER == "auto" then
     local ok, vid = pcall(resolve_via_http, artist, title)
@@ -456,7 +759,7 @@ local function resolve_track_video_id(artist, title)
 end
 
 -- =========================================================================
--- Core Refill Engine
+-- Core Refill Engine (Station Seed Driven)
 -- =========================================================================
 
 local function refill(force)
@@ -470,9 +773,29 @@ local function refill(force)
   if not force and ahead >= MIN_AHEAD then return end
 
   local cur_item = list[cur + 1]
-  local seed_artist, seed_title = extract_seed(cur_item)
-  if not seed_artist then
-    cliamp.log.warn("lb-radio: could not determine seed artist from current track")
+  local st_artist, st_mbid = get_station_seed()
+
+  -- Check if the current track was manually started by user
+  -- (i.e. not queued by listenbrainz-radio, or no station seed exists)
+  local is_manual = false
+  if cur_item and not is_auto_queued(cur_item) then
+    is_manual = true
+  end
+
+  if is_manual or not st_artist then
+    local a, t, m = extract_clean_metadata(cur_item)
+    if a and #a > 0 then
+      if a ~= st_artist then
+        cliamp.log.info(("lb-radio: manual track detected (%s - %s), anchoring station seed to %q"):format(a, t or "", a))
+        set_station_seed(a, m)
+        set_buffered_recs({}) -- clear buffer so recommendations match new seed
+        st_artist, st_mbid = a, m
+      end
+    end
+  end
+
+  if not st_artist then
+    cliamp.log.warn("lb-radio: could not determine station seed artist")
     return
   end
 
@@ -492,13 +815,13 @@ local function refill(force)
   if #buffered < BATCH then
     local fresh = {}
     if LB_TOKEN and #LB_TOKEN > 0 then
-      cliamp.log.info(("lb-radio: fetching explore radio for %q (mode: %s)"):format(seed_artist, mode))
-      fresh = fetch_lb_explore_radio(seed_artist, mode, LB_TOKEN)
+      cliamp.log.info(("lb-radio: fetching explore radio for station seed %q (mode: %s)"):format(st_artist, mode))
+      fresh = fetch_lb_explore_radio(st_artist, mode, LB_TOKEN)
     end
 
     if #fresh == 0 then
-      cliamp.log.info(("lb-radio: fetching artist radio for %q (mode: %s)"):format(seed_artist, mode))
-      local artist_mbid = resolve_artist_mbid(seed_artist)
+      cliamp.log.info(("lb-radio: fetching artist radio for station seed %q (mode: %s)"):format(st_artist, mode))
+      local artist_mbid = st_mbid or resolve_artist_mbid(st_artist)
       if artist_mbid then
         fresh = fetch_lb_artist_radio(artist_mbid, mode)
       end
@@ -525,7 +848,7 @@ local function refill(force)
         local vid = resolve_track_video_id(item.artist, item.title)
         if vid then
           local track_url = "https://www.youtube.com/watch?v=" .. vid
-          -- In cliamp >= 2.1.0 (such as 2.3.0), queue.add accepts a table with clean metadata
+          -- In cliamp >= 2.1.0, queue.add accepts a table with clean metadata
           local ok_add = pcall(cliamp.queue.add, {
             path   = track_url,
             title  = item.title,
@@ -534,6 +857,8 @@ local function refill(force)
           if not ok_add then
             cliamp.queue.add(track_url)
           end
+          -- Mark this track as auto-queued so playing it won't overwrite station seed
+          mark_auto_queued(track_url, item.artist, item.title)
           in_queue[key] = true
           added_keys[#added_keys + 1] = key
           added_count = added_count + 1
@@ -550,7 +875,7 @@ local function refill(force)
 
   if added_count > 0 then
     remember(added_keys)
-    cliamp.log.info(("lb-radio: added %d tracks (seed: %s, mode: %s)"):format(added_count, seed_artist, mode))
+    cliamp.log.info(("lb-radio: added %d tracks (station seed: %s, mode: %s)"):format(added_count, st_artist, mode))
     cliamp.message("LB radio +" .. added_count)
   else
     cliamp.log.warn("lb-radio: no new recommendations added")
@@ -612,9 +937,34 @@ p:command("mode", function(args)
   return "listenbrainz-radio: current mode is " .. get_active_mode()
 end)
 
+p:command("station", function(args)
+  local arg = nil
+  if type(args) == "table" then
+    arg = table.concat(args, " ")
+  elseif type(args) == "string" then
+    arg = args
+  end
+  arg = clean_str(arg)
+  if arg and #arg > 0 then
+    local mbid = resolve_artist_mbid(arg)
+    set_station_seed(arg, mbid)
+    set_buffered_recs({})
+    refill(true)
+    return ("listenbrainz-radio: station seed manually set to %q (mbid: %s)"):format(arg, tostring(mbid or "unresolved"))
+  end
+  local st_artist, st_mbid = get_station_seed()
+  if not st_artist then
+    return "listenbrainz-radio: no station seed currently set"
+  end
+  return ("listenbrainz-radio: station seed = %q (mbid: %s, mode: %s)"):format(
+    st_artist, tostring(st_mbid or "none"), get_active_mode()
+  )
+end)
+
 p:command("status", function()
-  return ("listenbrainz-radio: auto=%s | mode=%s | min_ahead=%d batch=%d cooldown=%ds history=%d buffer=%d"):format(
-    auto_on() and "on" or "off", get_active_mode(), MIN_AHEAD, BATCH, COOLDOWN, #history(), #get_buffered_recs()
+  local st_artist, st_mbid = get_station_seed()
+  return ("listenbrainz-radio: station=%q | auto=%s | mode=%s | ahead=%d/%d | history=%d buffer=%d"):format(
+    st_artist or "(none)", auto_on() and "on" or "off", get_active_mode(), MIN_AHEAD, BATCH, #history(), #get_buffered_recs()
   )
 end)
 
@@ -622,4 +972,12 @@ p:command("clear", function()
   cliamp.store.set("recent_keys", {})
   cliamp.store.set("buffered_recs", {})
   return "listenbrainz-radio: history and buffer cleared"
+end)
+
+p:command("reset", function()
+  clear_station_seed()
+  cliamp.store.set("auto_queued_keys", {})
+  cliamp.store.set("recent_keys", {})
+  cliamp.store.set("buffered_recs", {})
+  return "listenbrainz-radio: station seed, history, and recommendation buffer reset"
 end)

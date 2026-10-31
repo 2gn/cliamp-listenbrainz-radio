@@ -6,17 +6,17 @@
 
 ## What it does
 
-`listenbrainz-radio` monitors cliamp's queue. When fewer than `min_ahead` tracks remain, it inspects the **currently playing track's artist**, queries **ListenBrainz Radio** for similar artists and top recordings, resolves them to playable audio streams, and appends fresh tracks to your playback queue.
+`listenbrainz-radio` monitors cliamp's queue. When fewer than `min_ahead` tracks remain, it inspects your **Station Seed** (anchored to the manually played artist), queries **ListenBrainz Radio** for similar artists and top recordings, resolves them to playable audio streams, and appends fresh tracks to your playback queue.
 
-Because every refill re-seeds from whatever is currently playing, the radio continuously drifts across related artists, genres, and styles — giving you an endless, personalized listening session.
+Because recommendations stay anchored to your **Station Seed** rather than unconstrained random-walk drift, your radio stays faithful to your chosen vibe without getting permanently trapped in absorbent genre clusters (such as endless 90s rap loops). Whenever you manually select or queue a new track, the station seed automatically pivots to your new artist!
 
 ## Highlights
 
+- 📻 **Station Seed Anchoring:** Recommends tracks consistent with your manually chosen artist instead of drifting endlessly into repetitive sub-genres. Can also be manually locked to any artist via CLI.
 - ⚡ **Zero Setup / Tokenless by default:** Works immediately out of the box using public MusicBrainz and ListenBrainz radio endpoints. No API keys or accounts required.
 - 🔑 **Optional ListenBrainz Account Mode:** If you provide your ListenBrainz User Token, it can utilize the `/1/explore/lb-radio` prompt-based radio engine.
 - 🎯 **Configurable Radio Modes:** Choose between `"easy"` (similar/popular hits), `"medium"` (balanced exploration), and `"hard"` (deep cuts and obscure gems).
-- 📻 **Built-in Audio Stream Resolver:** Uses pure HTTP search extraction via `cliamp.http` to find playable streams with zero external dependencies. Can also fall back to `yt-dlp` if configured.
-- 🧠 **Smart Seed Detection:** Reads artist and title metadata, with automatic fallback parsing of `"Artist - Title"` formats from unstructured streams.
+- 🧠 **Multi-Part Title & Video Fluff Cleaner:** Intelligently parses YouTube titles with channel prefixes (e.g. `mypassionfruit - Kinobe - Slip Into Something More Comfortable` or `kinobe official - Kinobe - Slip into Something (Official Audio)`), removes video fluff and tags, and cross-references MusicBrainz artist & recording databases.
 - 🔄 **Anti-Repeat History & Caching:** Remembers recently queued tracks in `cliamp.store` to avoid repeats across refills and sessions, and caches artist MBIDs to respect API rate limits.
 
 ---
@@ -98,7 +98,11 @@ Simply start playing any song in cliamp. As the queue plays down to `min_ahead` 
 You can control the plugin at runtime from your terminal:
 
 ```sh
-# Force an immediate refill based on the current track (ignores cooldown & min_ahead)
+# Inspect or manually set the Station Seed artist
+cliamp plugins call listenbrainz-radio station
+cliamp plugins call listenbrainz-radio station "Kinobe"
+
+# Force an immediate refill based on the station seed (ignores cooldown & min_ahead)
 cliamp plugins call listenbrainz-radio start
 
 # Toggle auto-refill on/off
@@ -115,6 +119,9 @@ cliamp plugins call listenbrainz-radio status
 
 # Clear the anti-repeat history and candidate buffer
 cliamp plugins call listenbrainz-radio clear
+
+# Complete reset (station seed, history, and recommendation buffer)
+cliamp plugins call listenbrainz-radio reset
 ```
 
 ---
